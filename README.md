@@ -1,137 +1,123 @@
-# Gotta Hear Them All: Towards Sound Source Aware Audio Generation
+# How to Run — Full Pipeline (CSC 52002 Final Project)
 
-[![arXiv](https://img.shields.io/badge/arXiv-2411.15447-brightgreen?logo=arxiv&logoColor=white&style=flat-square)](https://arxiv.org/abs/2411.15447) [![githubio](https://img.shields.io/badge/GitHub.io-Demo_Website-blue?logo=Github&logoColor=white&style=flat-square)](https://ssv2a.github.io/SSV2A-demo/) [![Hugging Face Spaces](https://img.shields.io/badge/Gradio-Interactive_Demo-orange?logo=huggingface&logoColor=white&style=flat-square)](https://ssv2a.ngrok.io/) 
+**Author:** Taline Ouayjan  
+**Course:** CSC 52002 EP 2026 — Multimodal Generative AI
 
-**Flexibly generate sounds by composing visual, text, and audio sound source prompts.**
+---
 
-This work is accepted at AAAI 2026.
+## Before You Start — Important Note About Hardware
 
-In order to run our code, please clone the repository and follow these instructions to set up a virtual environment:
+I want to be upfront about this: the full pipeline (especially the 3D generation step) needs a machine with a dedicated NVIDIA GPU. A standard laptop without a GPU can run Steps 1 and 2 fine, but Step 3 (generating 3D meshes with Hunyuan3D-2) will either fail or take hours on CPU alone.
 
-1. `conda create -n SSV2A python==3.10`
-2. `pip install -r requirements.txt`
+If you want to see everything working end-to-end, the most reliable option is to run it on the university server (where I developed and tested it), or on any machine with at least a 16 GB VRAM GPU. 
 
-The `ssv2a` module provides implementations for SSV2A. We also provide scripts for major functions below.
+That said, the setup instructions below are complete from scratch — so if you do have access to a GPU machine, everything should just work.
 
-## Scheduled Releases
-- [ ] Distribute the VGG Sound Single Source (VGGS3) dataset.
-- [x] Upload code for multimodal inference.
-- [x] Upload code for vision-to-audio inference.
+---
 
-## Pretrained Weights
-We provide pretrained weights of SSV2A modules at [this google drive link](https://drive.google.com/drive/folders/17SAuZ2sZrTYf21BiNKhRsEfdj-fbeQQN?usp=sharing), 
-which has the following contents:
+## Step 1 — Clone the Repo and Set Up the Environment
 
-| Files      | Comment                                                                              |
-|------------|--------------------------------------------------------------------------------------|
-| ssv2a.json | Configuration File of SSV2A                                                          |
-| ssv2a.pth  | Pretrained Checkpoint of SSV2A                                                       |
-| agg.pth    | Pretrained Checkpoint of Temporal Aggregation Module (for video-to-audio generation) |
+You need **Python 3.9** on your machine (`python3 --version` to check). If you don't have it: [python.org/downloads](https://www.python.org/downloads/).
 
-Please download them according to your usage cases.
+```bash
+git clone https://github.com/TalineOuayjan/multimodal_final_project
+cd SSV2A
 
-As SSV2A works with [YOLOv8](https://docs.ultralytics.com/models/yolov8/) for visual sound source detection, 
-it also needs to include a pretrained YOLO checkpoint for inference. We recommend using [yolov8x-oi7](https://docs.ultralytics.com/datasets/detect/open-images-v7/) 
-pretrained on the OpenImagesV7 dataset. After downloading this model, paste its path in the `"detection-model"` field in `ssv2a.json`.
+# Create and activate a virtual environment
+python3 -m venv ssv2a_env
+source ssv2a_env/bin/activate          # Linux / Mac
+# ssv2a_env\Scripts\activate           # Windows
 
-## Inference
-There are several hyperparameters you can adjust to control the generation fidelity/diversity/relevance. We list them here:
-
-| Parameter         | Default Value | Comment                                                                                                                       |
-|-------------------|----|-------------------------------------------------------------------------------------------------------------------------------|
-| `--var_samples`   | 64 | Number of variational samples drawn in each generation and averaged. Higher number increases fidelity and decreases diversity. |
-| `--cycle_its`     | 64 | Number of Cycle Mix iterations. Higher number increases generation relevance to given conditions.                             |
-| `--cycle_samples` | 64 | Number of variational samples drawn in each Cycle Mix iteration. Higher number increases fidelity and decreases diversity.    |
-| `--duration` | 10 | Length of generated audio in seconds.                                                                                         |
-| `--seed`          | 42 | Random seed for generation.                                                                                                   |
-
-### Image to Audio Generation
-Navigate to the root directory of this repo and execute the following script:
-
-```shell
-python infer_i2a.py \
---cfg "ssv2a.json" \
---ckpt "ssv2a.pth" \
---image_dir "./images" \
---out_dir "./output"
-```
-Replace the arguments with the actual path names on your machine.
-
-### Video to Audio Generation
-Navigate to the root directory of this repo and execute the following script:
-
-```shell
-python infer_v2a.py \
---cfg "ssv2a.json" \
---ckpt "ssv2a.pth" \
---agg_ckpt "agg.pth" \
---image_dir "/images" \
---out_dir "./output"
-```
-Replace the arguments with the actual path names on your machine.
-
-### Multimodal Sound Source Composition
-SSV2A accepts multimodal conditions where you describe sound sources as image, text, or audio.
-
-You need to download the DALLE-2 Prior module first in order to close the modality gap of text conditions in CLIP. 
-We recommend [this version pretrained by LAION](https://huggingface.co/laion/DALLE2-PyTorch). 
-You can also download from [our drive](https://drive.google.com/drive/folders/17SAuZ2sZrTYf21BiNKhRsEfdj-fbeQQN?usp=sharing):
-
-| Item               | File |
-|--------------------|------|
-| Configuration File | dalle2_prior_config.json |
-| Checkpoint | dalle2_prior.pth |
-
-When these are ready, navigate to the root directory of this repo and execute the following script:
-
-```shell
-python infer_v2a.py \
---cfg "ssv2a.json" \
---ckpt "ssv2a.pth" \
---dalle2_cfg "dalle2_prior_config.json" \
---dalle2_ckpt "dalle2_prior.pth" \
---images "talking_man.png" "dog.png" \
---texts "raining heavily" "street ambient" \
---audios "thunder.wav" \
---out_dir "./output/audio.wav"
+# Install all dependencies
+pip install -r requirements.txt
+pip install -r Hunyuan3D-2/requirements.txt
+pip install gradio fastapi uvicorn soundfile transformers diffusers accelerate openai trimesh
 ```
 
-Here are some argument specifications:
-1. `--images` takes visual conditions as a list of images as `.png` or `.jpg` files.
-2. `--texts` takes text conditions as a list of strings.
-3. `--audios` takes audio conditions as a list of `.wav`, `.flac`, or `.mp3` files.
+---
 
-Note that this script, unlike our I2A and V2A codes, only support single-sample inference instead of batches. 
-We support a maximum of 64 sound source condition slots in total for generation. 
-You can leave any modality blank for flexibility. You can also only supply one modality only, such as texts.
+## Step 2 — Download the Weights
 
-Feel free to play with this feature and let your imagination run wild :)
+The model weights are too large for GitHub so they're hosted on Google Drive. Download them all from here:
 
-## Cite this work
-If you find our work useful, please consider citing
+**[Download weights — Google Drive](https://drive.google.com/drive/folders/1ffC2pe2t9qcyQWIThdURfQOynktSxpfW?usp=sharing)**
 
-```bibtex
-@inproceedings{SS2A,
-  title={Gotta Hear Them All: Towards Sound Source Aware Audio Generation},
-  author={Guo, Wei and Wang, Heng and Ma, Jianbo and Cai, Weidong},
-  booktitle={AAAI},
-  year={2026}
-}
+Once downloaded, place them like this:
+
+```
+SSV2A/
+├── sam_b.pt                     ← place in the root (next to pipeline.py)
+└── weights/
+    ├── ssv2a.json               ← already in the repo, don't touch
+    ├── dalle2_prior_config.json ← already in the repo, don't touch
+    ├── ssv2a.pth                ← from Drive
+    ├── agg.pth                  ← from Drive
+    ├── dalle2_prior.pth         ← from Drive
+    └── yolov8x-oiv7.pt          ← from Drive
 ```
 
-## References
-SSV2A has made friends with several models. 
-We list major references in our code here:
+The following models will download **automatically on first run** from HuggingFace — just make sure you have internet access and about 20 GB of free disk space:
+- **Depth-Anything-V2** (~400 MB) — depth estimation
+- **Hunyuan3D-2** (~8 GB) — 3D mesh generation, only needed for Step 3
+- **AudioLDM / BLIP / CLIP** (a few GB total) — audio generation and captioning
 
-1. [AudioLDM](https://github.com/haoheliu/AudioLDM), by Haohe Liu
-2. [AudioLDM2](https://github.com/haoheliu/AudioLDM2), by Haohe Liu
-3. [LAION-Audio-630K](https://github.com/LAION-AI/audio-dataset), by LAION
-4. [CLAP](https://github.com/LAION-AI/CLAP), by LAION
-3. [frechet-audio-distance](https://github.com/gudgud96/frechet-audio-distance), by Haohao Tan
-4. [DALLE2-pytorch](https://github.com/lucidrains/DALLE2-pytorch), by Phil Wang
-5. [CLIP](https://github.com/openai/CLIP), by OpenAI
+---
 
-Thank you for the excellent works! Other references are commented inline.
+## Step 3 — API Key (for the LLM filter)
+
+The pipeline uses GPT-4o Vision in Step 2 to filter out silent objects. The API key is already set up in the `.env` file at the root of the project, so you don't need to do anything.
+
+If for any reason it doesn't work, you can just check **"Skip LLM filter"** in the UI and the pipeline will keep all detected objects without calling the API.
+
+---
+
+## Step 4 — Run the Pipeline
+
+```bash
+cd SSV2A
+source ssv2a_env/bin/activate
+python pipeline.py --port 7875
+```
+
+Then open your browser and go to **http://localhost:7875**
+
+---
+
+## Step 5 — Using the Interface
+
+The UI is organized into four sequential steps:
+
+**Step 1 — Detect Objects**  
+Upload any image, and click "Detect Objects". YOLO will draw bounding boxes around all detected objects and the depth map will appear on the right. You can uncheck any objects you don't want to include — they'll be grayed out and skipped in all following steps.
+
+**Step 2 — Run Processing Chain**  
+Click "Run Processing Chain". This runs the GPT-4o filter (to drop silent objects like walls), SAM segmentation (to get clean cutouts), BLIP captioning (to describe each object in text), and CLIP embedding (to encode each object for audio generation). You can check "Skip LLM filter" if you want to keep all objects.
+
+**Step 3 — Generate 3D World**  
+Click "Generate 3D World". This is the slow step — Hunyuan3D-2 generates a 3D mesh for each object (about 2–5 minutes per object on GPU). When done, you'll see an interactive 3D viewer where you can orbit the camera. Use the camera controls to position yourself somewhere in the scene — your position will affect the audio in the next step.
+
+**Step 4 — Generate Spatial Audio**  
+Click "Generate Spatial Audio". The pipeline generates a sound for each object (SSV2A/AudioLDM), then mixes them into a stereo output based on your camera position — closer objects are louder, and objects to the left/right pan accordingly. You can move the camera and click "Re-render Audio" to instantly re-mix without regenerating.
 
 
+## Project Structure (for reference)
 
+```
+SSV2A/
+├── pipeline.py                      ← main file, run this
+├── gradio_3d_world.py               ← standalone 3D + audio (no preprocessing)
+├── weights/                         ← all pretrained weights (included)
+├── ssv2a/
+│   ├── data/
+│   │   ├── detect_gemini_SAM.py     ← YOLO detection
+│   │   ├── depth_estimation.py      ← Depth-Anything depth estimation
+│   │   └── utils.py                 ← CLIP embedding utilities
+│   └── model/
+│       ├── pipeline.py              ← base SSV2A image-to-audio
+│       ├── pipeline_mm2a_SAM.py     ← LLM + SAM + BLIP + CLIP
+│       ├── generate_3d_scene.py     ← Hunyuan3D-2 mesh generation
+│       ├── spatial_3d.py            ← 3D spatial audio logic
+│       ├── aldm.py                  ← AudioLDM wrapper
+│       └── clap.py                  ← CLAP embedding
+└── Hunyuan3D-2/                     ← 3D generation backend
+```
