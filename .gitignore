@@ -1,0 +1,34 @@
+.idea
+__pycache__/
+*.pyc
+
+# Virtual environments
+ssv2a_env/
+soundenv/
+hy3d_env/
+*_env/
+.venv/
+
+# Model weights & large checkpoints
+weights/
+sam_b.pt
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.onnx
+*.npz
+*.npy
+
+# Generated outputs
+output/
+outputs/
+*.glb
+*.gltf
+*.wav
+*.mp3
+*.flac
+
+# Misc
+.env
+*.log

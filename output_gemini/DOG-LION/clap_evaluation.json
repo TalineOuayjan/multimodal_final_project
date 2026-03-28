@@ -1,0 +1,38 @@
+{
+  "positive_prompt": "dog barking",
+  "negative_prompt": "lion roaring.",
+  "results": [
+    {
+      "label": "Original",
+      "path": "output/DOG-LION/DOG-LION.wav",
+      "positive": 0.30099350214004517,
+      "negative": 0.47278058528900146,
+      "neg_clamped": 0.47278058528900146,
+      "alignment": -0.1717870831489563
+    },
+    {
+      "label": "Gemini",
+      "path": "output_gemini/DOG-LION/DOG-LION.wav",
+      "positive": 0.371080219745636,
+      "negative": 0.3686080574989319,
+      "neg_clamped": 0.3686080574989319,
+      "alignment": 0.0024721622467041016
+    },
+    {
+      "label": "Gemini-BLIP",
+      "path": "output_mm2a_gemini_BLIP/DOG-LION/DOG-LION.wav",
+      "positive": 0.4206312298774719,
+      "negative": 0.27515918016433716,
+      "neg_clamped": 0.27515918016433716,
+      "alignment": 0.14547204971313477
+    },
+    {
+      "label": "Gemini-BLIP-SAM",
+      "path": "output_mm2a_SAM/DOG-LION/DOG-LION.wav",
+      "positive": 0.3570641875267029,
+      "negative": 0.37656012177467346,
+      "neg_clamped": 0.37656012177467346,
+      "alignment": -0.01949593424797058
+    }
+  ]
+}

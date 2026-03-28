@@ -1,0 +1,652 @@
+"""
+generate_3d_scene.py — Generative 3D world from a single image.
+
+Uses **Shap-E** (OpenAI's text-to-3D model) to generate coloured 3D meshes
+from the object *labels* detected by YOLO.  This is purely generative: we
+do NOT reconstruct anything from the image pixels — we use the image only
+for detection labels + colour sampling for environment.
+
+Pipeline
+--------
+1. YOLO detects objects → bounding boxes + labels ("Lion", "Chicken", …)
+2. Depth estimation → per-object depth (for 3D positioning)
+3. For each label → Shap-E generates a complete 3D mesh from text
+4. Meshes are scaled, positioned in 3D world using depth + camera intrinsics
+5. Terrain + sky dome are generated from image colour cues
+6. Combined scene exported as .glb
+
+Public API
+----------
+    load_shape(device)                                   → (xm, model, diffusion)
+    generate_object_mesh(label, …)                       → trimesh.Trimesh
+    build_3d_world(meshes, objects_3d, …)                → trimesh.Scene
+    export_scene_glb(scene, output_path)                 → path to .glb
+
+Dependencies
+------------
+    - shap_e  (pip install git+https://github.com/openai/shap-e.git)
+    - trimesh, torch
+"""
+
+from __future__ import annotations
+
+import math
+import os
+import sys
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+import numpy as np
+import torch
+import trimesh
+from PIL import Image, ImageFilter
+
+# ── HF / shap-e cache helper ──────────────────────────────────────────────
+
+def _default_hf_cache() -> Optional[str]:
+    """Auto-detect /Data/<user>/hf_cache/ to avoid home-dir quota issues."""
+    try:
+        user = os.getenv("USER") or os.getenv("LOGNAME") or "unknown"
+        candidate = Path(f"/Data/{user}/hf_cache/hub")
+        if candidate.parent.exists():
+            candidate.mkdir(parents=True, exist_ok=True)
+            return str(candidate)
+    except Exception:
+        pass
+    return None
+
+
+def _set_hf_cache_env() -> None:
+    """Set cache env vars so model downloads go to /Data."""
+    cache = _default_hf_cache()
+    if cache and not os.environ.get("HF_HUB_CACHE"):
+        os.environ["HF_HUB_CACHE"] = cache
+        os.environ["HUGGINGFACE_HUB_CACHE"] = cache
+    # Shap-E uses XDG_CACHE_HOME for its own downloads
+    user = os.getenv("USER") or os.getenv("LOGNAME") or "unknown"
+    xdg = f"/Data/{user}/cache/xdg"
+    os.makedirs(xdg, exist_ok=True)
+    os.environ.setdefault("XDG_CACHE_HOME", xdg)
+
+
+# Set cache env vars immediately
+_set_hf_cache_env()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 1.  Load Shap-E models
+# ═══════════════════════════════════════════════════════════════════════════
+
+_shape_models = None  # singleton cache: (xm, text_model, diffusion)
+
+
+def load_shape(
+    device: str = "cuda:0",
+) -> tuple:
+    """Load Shap-E text-to-3D models (singleton — loaded once, reused).
+
+    Returns
+    -------
+    xm : transmitter model (decodes latents → mesh)
+    text_model : text300M conditioner
+    diffusion : gaussian diffusion config
+    """
+    global _shape_models
+    if _shape_models is not None:
+        return _shape_models
+
+    import warnings
+    warnings.filterwarnings("ignore", category=FutureWarning)
+
+    from shap_e.diffusion.gaussian_diffusion import diffusion_from_config
+    from shap_e.models.download import load_model, load_config
+
+    print("[Shap-E] Loading transmitter + text300M ...")
+    xm = load_model("transmitter", device=torch.device(device))
+    text_model = load_model("text300M", device=torch.device(device))
+    diffusion = diffusion_from_config(load_config("diffusion"))
+    print("[Shap-E] Models loaded and ready.")
+
+    _shape_models = (xm, text_model, diffusion)
+    return _shape_models
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 2.  Generate a 3D mesh from a text label
+# ═══════════════════════════════════════════════════════════════════════════
+
+def generate_object_mesh(
+    label: str,
+    device: str = "cuda:0",
+    guidance_scale: float = 15.0,
+    num_steps: int = 64,
+) -> trimesh.Trimesh:
+    """Generate a coloured 3D mesh from a text label using Shap-E.
+
+    Parameters
+    ----------
+    label : str
+        Object name, e.g. "Lion", "Chicken", "Car".
+        Automatically wrapped into a better prompt like "a realistic lion".
+    device : str
+    guidance_scale : float
+        Classifier-free guidance (15 is a good default).
+    num_steps : int
+        Diffusion steps (64 = good, 128 = higher quality but slower).
+
+    Returns
+    -------
+    mesh : trimesh.Trimesh with vertex colours.
+    """
+    from shap_e.diffusion.sample import sample_latents
+    from shap_e.util.notebooks import decode_latent_mesh
+
+    xm, text_model, diffusion = load_shape(device)
+
+    # Build a descriptive prompt from the label
+    prompt = f"a {label.lower()}, 3d model, detailed, realistic"
+
+    latents = sample_latents(
+        batch_size=1,
+        model=text_model,
+        diffusion=diffusion,
+        guidance_scale=guidance_scale,
+        model_kwargs=dict(texts=[prompt]),
+        progress=True,
+        clip_denoised=True,
+        use_fp16=True,
+        use_karras=True,
+        karras_steps=num_steps,
+        sigma_min=1e-3,
+        sigma_max=160,
+        s_churn=0,
+    )
+
+    # Decode latent → triangle mesh with vertex colours
+    tri = decode_latent_mesh(xm, latents[0]).tri_mesh()
+    verts = np.array(tri.verts)
+    faces = np.array(tri.faces)
+    channels = tri.vertex_channels  # dict with 'R', 'G', 'B'
+
+    colors = np.column_stack([
+        (np.clip(np.array(channels["R"]), 0, 1) * 255).astype(np.uint8),
+        (np.clip(np.array(channels["G"]), 0, 1) * 255).astype(np.uint8),
+        (np.clip(np.array(channels["B"]), 0, 1) * 255).astype(np.uint8),
+        np.full(len(verts), 255, dtype=np.uint8),
+    ])
+
+    mesh = trimesh.Trimesh(
+        vertices=verts, faces=faces, vertex_colors=colors, process=False,
+    )
+    return mesh
+
+
+def _boost_vertex_colors(
+    mesh: trimesh.Trimesh,
+    brightness: float = 1.3,
+    saturation: float = 1.1,
+) -> None:
+    """Boost vertex color brightness & saturation in-place.
+
+    TripoSR's predicted colors are often muted/dark when rendered under
+    default lighting.  A mild gamma + saturation lift makes them pop
+    in the GLB viewer.
+    """
+    if not hasattr(mesh.visual, 'vertex_colors'):
+        return
+    colors = np.array(mesh.visual.vertex_colors, dtype=np.float32)
+    rgb = colors[:, :3] / 255.0
+    # brightness (gamma)
+    rgb = np.clip(rgb * brightness, 0.0, 1.0)
+    # saturation
+    gray = rgb.mean(axis=1, keepdims=True)
+    rgb = np.clip(gray + saturation * (rgb - gray), 0.0, 1.0)
+    colors[:, :3] = (rgb * 255.0).astype(np.uint8)
+    mesh.visual.vertex_colors = colors.astype(np.uint8)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 2b.  Generate environment — terrain + sky (NOT reconstruction)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _sample_dominant_color(
+    image_pil: Image.Image,
+    region: str = "bottom",
+    fraction: float = 0.30,
+    n_samples: int = 200,
+) -> np.ndarray:
+    """Sample dominant colour from a region of the image.
+
+    Parameters
+    ----------
+    region : "bottom" | "top" | "full"
+    fraction : float  — what portion of the image to sample from.
+    n_samples : int   — number of pixel samples to average.
+
+    Returns
+    -------
+    rgb : np.ndarray, shape (3,), dtype uint8
+    """
+    arr = np.array(image_pil.convert("RGB"))
+    H, W, _ = arr.shape
+    if region == "bottom":
+        sub = arr[int(H * (1 - fraction)):, :, :]
+    elif region == "top":
+        sub = arr[:int(H * fraction), :, :]
+    else:
+        sub = arr
+    # Random sample of pixels
+    flat = sub.reshape(-1, 3)
+    idx = np.random.choice(len(flat), min(n_samples, len(flat)), replace=False)
+    return flat[idx].mean(axis=0).astype(np.uint8)
+
+
+def create_terrain_mesh(
+    image_pil: Image.Image,
+    scene_extent_x: float = 100.0,
+    scene_extent_z: float = 120.0,
+    y_ground: float = 0.0,
+    grid_res: int = 40,
+    noise_amplitude: float = 0.3,
+) -> trimesh.Trimesh:
+    """Generate a textured ground-plane / terrain mesh.
+
+    The ground is coloured by sampling the bottom portion of the original
+    image — so a grassy scene gets green terrain, a sandy scene gets beige,
+    etc.  A small amount of Perlin-like noise is added for a natural feel.
+
+    Parameters
+    ----------
+    image_pil : PIL.Image
+        The source image (used only for colour sampling).
+    scene_extent_x, scene_extent_z : float
+        Half-extents of the ground in X (left/right) and Z (depth).
+    y_ground : float
+        Y position of the ground plane.
+    grid_res : int
+        Grid resolution (grid_res × grid_res quads).
+    noise_amplitude : float
+        Vertical noise for slight terrain undulation (0 = flat).
+
+    Returns
+    -------
+    terrain : trimesh.Trimesh  (with vertex colours)
+    """
+    # Sample ground colour from the bottom of the image
+    base_color = _sample_dominant_color(image_pil, region="bottom", fraction=0.35)
+
+    xs = np.linspace(-scene_extent_x, scene_extent_x, grid_res + 1)
+    zs = np.linspace(0, scene_extent_z, grid_res + 1)
+    xx, zz = np.meshgrid(xs, zs)
+
+    # Gentle terrain undulation — simple sin-based noise
+    yy = np.ones_like(xx) * y_ground
+    if noise_amplitude > 0:
+        yy += noise_amplitude * (
+            np.sin(xx * 0.3) * np.cos(zz * 0.2)
+            + 0.5 * np.sin(xx * 0.7 + 1.3) * np.cos(zz * 0.5 + 0.7)
+        )
+
+    verts = np.stack([xx, yy, zz], axis=-1).reshape(-1, 3)
+
+    # Per-vertex colour: base colour + random variation for natural look
+    n_verts = len(verts)
+    noise = np.random.randint(-15, 16, (n_verts, 3)).astype(np.int16)
+    colors_rgb = np.clip(base_color.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+
+    # Darken distant vertices slightly (depth fog effect)
+    z_norm = (verts[:, 2] - verts[:, 2].min()) / (np.ptp(verts[:, 2]) + 1e-8)
+    darken = (1.0 - 0.25 * z_norm).reshape(-1, 1)
+    colors_rgb = (colors_rgb.astype(np.float32) * darken).clip(0, 255).astype(np.uint8)
+
+    colors_rgba = np.column_stack(
+        [colors_rgb, np.full(n_verts, 255, dtype=np.uint8)]
+    )
+
+    # Build triangle faces
+    h_g, w_g = grid_res + 1, grid_res + 1
+    faces = []
+    for r in range(grid_res):
+        for c in range(grid_res):
+            i00 = r * w_g + c
+            i01 = r * w_g + (c + 1)
+            i10 = (r + 1) * w_g + c
+            i11 = (r + 1) * w_g + (c + 1)
+            faces.append([i00, i10, i01])
+            faces.append([i01, i10, i11])
+
+    mesh = trimesh.Trimesh(
+        vertices=verts,
+        faces=np.array(faces, dtype=np.int64),
+        vertex_colors=colors_rgba,
+        process=False,
+    )
+    return mesh
+
+
+def create_sky_dome(
+    image_pil: Image.Image,
+    radius: float = 150.0,
+    subdivisions: int = 3,
+) -> trimesh.Trimesh:
+    """Generate a sky dome colored to match the image sky.
+
+    Samples the top portion of the image for the zenith colour and
+    blends towards the horizon. The result is a large sphere that wraps
+    the entire scene.
+    """
+    dome = trimesh.creation.icosphere(subdivisions=subdivisions, radius=radius)
+    verts = dome.vertices
+
+    # Sample sky colour from the top of the image
+    sky_color = _sample_dominant_color(image_pil, region="top", fraction=0.25)
+    # Horizon colour — slightly brighter / lighter
+    horizon_color = np.clip(sky_color.astype(np.float32) * 1.3 + 40, 0, 255).astype(np.uint8)
+
+    # Elevation factor: 1 at zenith (top), 0 at horizon
+    elev = verts[:, 1] / radius  # -1 (bottom) to +1 (top)
+    # In our coord system Y-down, so "sky" is negative Y
+    sky_factor = np.clip(-elev, 0, 1)  # 1 at top (Y very negative), 0 at horizon
+
+    # Blend sky_color (top) ↔ horizon_color (horizon)
+    colors = np.zeros((len(verts), 3), dtype=np.float32)
+    for c in range(3):
+        colors[:, c] = sky_color[c] * sky_factor + horizon_color[c] * (1 - sky_factor)
+    colors = colors.clip(0, 255).astype(np.uint8)
+
+    # Bottom hemisphere: darker ground-like colour (not seen much, but helps)
+    ground_mask = elev > 0.1  # Y positive = below horizon
+    ground_color = _sample_dominant_color(image_pil, region="bottom", fraction=0.30)
+    colors[ground_mask] = (ground_color * 0.5).astype(np.uint8)
+
+    dome_rgba = np.column_stack([colors, np.full(len(verts), 200, dtype=np.uint8)])
+    dome.visual.vertex_colors = dome_rgba
+    return dome
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 3.  Build a 3D world scene
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _estimate_mesh_scale(
+    bbox: List[float],
+    depth: float,
+    fx: float,
+    fy: float,
+) -> float:
+    """Estimate the real-world scale factor for a mesh based on bbox + depth.
+
+    The mesh from TripoSR is normalised to ~[-0.5, 0.5].
+    We estimate the real-world size of the object from its bounding box
+    projected at the estimated depth.
+
+    scale ≈ max(bbox_width_3d, bbox_height_3d) / 1.0
+    where bbox_width_3d = (x2-x1) * depth / fx
+    """
+    x1, y1, x2, y2 = bbox
+    w_3d = abs(x2 - x1) * depth / fx
+    h_3d = abs(y2 - y1) * depth / fy
+    return max(w_3d, h_3d)
+
+
+def build_3d_world(
+    meshes: List[trimesh.Trimesh],
+    objects_3d: list,  # List[Object3D] from spatial_3d
+    camera_fx: float = 500.0,
+    camera_fy: float = 500.0,
+    terrain_mesh: Optional[trimesh.Trimesh] = None,
+    sky_dome: Optional[trimesh.Trimesh] = None,
+    boost_colors: bool = True,
+) -> trimesh.Scene:
+    """Position generated meshes in a unified 3D world.
+
+    Each mesh is:
+    1. Vertex colours boosted for visibility
+    2. Scaled based on the object's bounding box size at its estimated depth
+    3. Translated to the 3D position from backprojection
+
+    The scene also includes:
+    - A generated terrain (ground plane with image-matched colours)
+    - A sky dome (coloured hemisphere)
+
+    Parameters
+    ----------
+    meshes : list of trimesh.Trimesh
+        One mesh per detected object (generated by Shap-E from text labels).
+    objects_3d : list of Object3D
+        3D positions from backproject_objects().
+    camera_fx, camera_fy : float
+        Camera focal lengths for 3D scale estimation.
+    terrain_mesh : trimesh.Trimesh or None
+        Generated ground / terrain mesh.
+    sky_dome : trimesh.Trimesh or None
+        Generated skybox dome.
+    boost_colors : bool
+        If True, brighten TripoSR vertex colours.
+
+    Returns
+    -------
+    scene : trimesh.Scene
+        Combined scene with all items placed in world space.
+    """
+    scene = trimesh.Scene()
+
+    # ── Determine object Y positions to place terrain correctly ──
+    y_max = max(o.Y for o in objects_3d) if objects_3d else 10.0
+    # Objects have Y-down coord: larger Y = lower in the image = ground level
+    # Terrain should sit at or just below the lowest object
+    ground_y = y_max + 2.0  # slightly below the lowest object
+
+    # ── Add terrain ──
+    if terrain_mesh is not None:
+        # Shift terrain to ground level
+        terrain_copy = terrain_mesh.copy()
+        terrain_copy.vertices[:, 1] += ground_y
+        scene.add_geometry(terrain_copy, geom_name="terrain")
+
+    # ── Add sky dome ──
+    if sky_dome is not None:
+        dome_copy = sky_dome.copy()
+        # Centre dome on the scene
+        if objects_3d:
+            cx = np.mean([o.X for o in objects_3d])
+            cz = np.mean([o.Z for o in objects_3d])
+            dome_copy.vertices[:, 0] += cx
+            dome_copy.vertices[:, 2] += cz
+        scene.add_geometry(dome_copy, geom_name="sky_dome")
+
+    # ── Place each detected-object mesh ──
+    for i, (mesh, obj) in enumerate(zip(meshes, objects_3d)):
+        # Scale mesh to approximate real-world size
+        scale = _estimate_mesh_scale(
+            obj.bbox, obj.depth_value, camera_fx, camera_fy
+        )
+        # Clamp scale to avoid extreme values
+        scale = max(0.5, min(scale, 50.0))
+
+        # Centre the mesh at origin, then scale and translate
+        mesh_copy = mesh.copy()
+
+        # Boost vertex colours so they're visible in the viewer
+        if boost_colors:
+            _boost_vertex_colors(mesh_copy, brightness=1.4, saturation=1.15)
+
+        # Centre at mesh centroid
+        centroid = mesh_copy.vertices.mean(axis=0)
+        mesh_copy.vertices -= centroid
+
+        # Scale
+        mesh_copy.vertices *= scale
+
+        # Translate to 3D world position
+        # Object3D: X=right, Y=down, Z=forward
+        translation = np.array([obj.X, obj.Y, obj.Z])
+        mesh_copy.vertices += translation
+
+        name = f"{i:02d}_{obj.label}"
+        scene.add_geometry(mesh_copy, geom_name=name)
+
+    # Add a camera marker at origin
+    cam_marker = trimesh.creation.icosphere(radius=0.3, subdivisions=1)
+    cam_marker.visual.vertex_colors = [255, 0, 0, 200]
+    scene.add_geometry(cam_marker, geom_name="camera_origin")
+
+    return scene
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 4.  Export helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+def export_scene_glb(scene: trimesh.Scene, output_path: str) -> str:
+    """Export the scene as a .glb file for 3D viewing.
+
+    Parameters
+    ----------
+    scene : trimesh.Scene
+    output_path : str
+
+    Returns
+    -------
+    path : str  (absolute path to the exported file)
+    """
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    # Export only mesh geometries (skip Path3D which can't export to glb)
+    meshes_only = trimesh.Scene()
+    for name, geom in scene.geometry.items():
+        if isinstance(geom, trimesh.Trimesh):
+            meshes_only.add_geometry(geom, geom_name=name)
+    meshes_only.export(output_path)
+    return os.path.abspath(output_path)
+
+
+def export_individual_glbs(
+    meshes: List[trimesh.Trimesh],
+    labels: List[str],
+    output_dir: str,
+) -> List[str]:
+    """Export each mesh as a separate .glb file.
+
+    Returns list of file paths.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    paths = []
+    for i, (mesh, label) in enumerate(zip(meshes, labels)):
+        fname = f"{i:02d}_{label.replace(' ', '_')}.glb"
+        fpath = os.path.join(output_dir, fname)
+        mesh.export(fpath)
+        paths.append(fpath)
+    return paths
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 5.  High-level convenience function — full pipeline
+# ═══════════════════════════════════════════════════════════════════════════
+
+def generate_3d_world_from_detections(
+    image: Image.Image,
+    bboxes: List[List[float]],
+    labels: List[str],
+    depths: List[float],
+    img_width: int,
+    img_height: int,
+    device: str = "cuda:0",
+    hfov_deg: float = 60.0,
+    guidance_scale: float = 15.0,
+    num_steps: int = 64,
+    output_path: Optional[str] = None,
+) -> Tuple[trimesh.Scene, List[trimesh.Trimesh], list]:
+    """End-to-end: detections → 3D meshes → generated world scene.
+
+    This is a **generative** pipeline — not reconstruction:
+    - YOLO detects objects → labels ("Lion", "Chicken", …)
+    - Shap-E generates full 3D meshes from those text labels
+    - The terrain / ground is generated with colours matching the image
+    - A sky dome wraps the scene with appropriate sky colours
+
+    Parameters
+    ----------
+    image : PIL.Image
+        The original full image.
+    bboxes : list of [x1, y1, x2, y2]
+    labels : list of str
+    depths : list of float
+    img_width, img_height : int
+    device : str
+    hfov_deg : float
+    guidance_scale : float
+        Classifier-free guidance for Shap-E (15 = good default).
+    num_steps : int
+        Diffusion steps (64 = fast, 128 = higher quality).
+    output_path : str or None
+        If given, export the scene as .glb to this path.
+
+    Returns
+    -------
+    scene : trimesh.Scene
+    meshes : list of trimesh.Trimesh
+    objects_3d : list of Object3D
+    """
+    from ssv2a.model.spatial_3d import (
+        CameraIntrinsics,
+        backproject_objects,
+    )
+
+    # 1. Load Shap-E
+    load_shape(device)  # preload singleton
+
+    # 2. Camera intrinsics
+    cam = CameraIntrinsics.from_image_size(img_width, img_height, hfov_deg)
+
+    # 3. Backproject objects to 3D
+    objects_3d = backproject_objects(
+        bboxes, labels, depths,
+        img_width, img_height,
+        camera=cam,
+        hfov_deg=hfov_deg,
+    )
+
+    # 4. Generate 3D mesh for each detected object FROM LABEL (text-to-3D)
+    meshes = []
+    for i, obj in enumerate(objects_3d):
+        print(f"[Shap-E] Generating mesh {i+1}/{len(objects_3d)}: '{obj.label}' ...")
+        mesh = generate_object_mesh(
+            obj.label, device=device,
+            guidance_scale=guidance_scale, num_steps=num_steps,
+        )
+        meshes.append(mesh)
+        print(f"  → {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
+
+    # 5. Generate terrain (coloured ground plane matching image)
+    max_z = max(o.Z for o in objects_3d) if objects_3d else 50
+    max_x = max(abs(o.X) for o in objects_3d) if objects_3d else 30
+    print("[3D World] Generating terrain ...")
+    terrain = create_terrain_mesh(
+        image,
+        scene_extent_x=max(max_x * 2, 60),
+        scene_extent_z=max(max_z * 1.5, 80),
+        y_ground=0.0,
+        grid_res=40,
+    )
+    print(f"  → terrain: {len(terrain.vertices)} verts")
+
+    # 6. Generate sky dome
+    print("[3D World] Generating sky dome ...")
+    dome = create_sky_dome(image, radius=max(max_z * 2.5, 120))
+
+    # 7. Build combined 3D world
+    scene = build_3d_world(
+        meshes, objects_3d,
+        camera_fx=cam.fx,
+        camera_fy=cam.fy,
+        terrain_mesh=terrain,
+        sky_dome=dome,
+        boost_colors=True,
+    )
+
+    # 8. Export if requested
+    if output_path:
+        export_scene_glb(scene, output_path)
+        print(f"[3D World] Scene exported to {output_path}")
+
+    return scene, meshes, objects_3d

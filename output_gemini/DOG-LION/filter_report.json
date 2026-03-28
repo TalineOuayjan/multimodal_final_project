@@ -1,0 +1,14 @@
+{
+  "model": "gpt-4o",
+  "results": [
+    {
+      "image": "DOG-LION.png",
+      "kept": [
+        "DOG-LION_1.png"
+      ],
+      "dropped": [
+        "DOG-LION_0.png"
+      ]
+    }
+  ]
+}

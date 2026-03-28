@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D World — Unity-Style Viewer</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#1a1a2e; overflow:hidden; font-family:'Segoe UI',system-ui,sans-serif; color:#e0e0e0; }
+  #canvas-container { width:100vw; height:100vh; position:relative; }
+  canvas { display:block; }
+
+  /* HUD overlay */
+  #hud { position:absolute; top:12px; left:12px; z-index:10; pointer-events:none; }
+  #hud .panel {
+    background:rgba(10,10,30,0.85); border:1px solid rgba(100,140,255,0.3);
+    border-radius:8px; padding:10px 14px; margin-bottom:8px;
+    backdrop-filter:blur(6px); font-size:13px; line-height:1.6;
+    pointer-events:auto;
+  }
+  #hud .panel h3 { color:#7da8ff; font-size:14px; margin-bottom:4px; }
+  .coord { font-family:'Consolas','Courier New',monospace; color:#90ee90; }
+  .label-tag { display:inline-block; background:rgba(100,140,255,0.2); border:1px solid rgba(100,140,255,0.4);
+    border-radius:4px; padding:1px 6px; margin:2px; font-size:11px; }
+
+  /* Controls help */
+  #controls-help {
+    position:absolute; bottom:12px; left:50%; transform:translateX(-50%);
+    z-index:10; pointer-events:none;
+    background:rgba(10,10,30,0.85); border:1px solid rgba(100,140,255,0.3);
+    border-radius:8px; padding:8px 18px; font-size:12px;
+    backdrop-filter:blur(6px); text-align:center;
+  }
+  #controls-help kbd {
+    background:rgba(255,255,255,0.1); border:1px solid rgba(255,255,255,0.2);
+    border-radius:3px; padding:1px 5px; font-size:11px;
+  }
+
+  /* Mode toggle button */
+  #mode-toggle {
+    position:absolute; top:12px; right:12px; z-index:10;
+    background:rgba(10,10,30,0.85); border:1px solid rgba(100,140,255,0.4);
+    border-radius:8px; padding:8px 16px; color:#7da8ff; cursor:pointer;
+    font-size:13px; font-weight:600; backdrop-filter:blur(6px);
+  }
+  #mode-toggle:hover { background:rgba(40,40,80,0.9); border-color:#7da8ff; }
+
+  /* Send camera button */
+  #send-camera {
+    position:absolute; bottom:12px; right:12px; z-index:10;
+    background:linear-gradient(135deg,#4a6cf7,#6366f1); border:none;
+    border-radius:8px; padding:12px 20px; color:#fff; cursor:pointer;
+    font-size:14px; font-weight:600; box-shadow:0 2px 8px rgba(99,102,241,0.4);
+  }
+  #send-camera:hover { transform:scale(1.02); box-shadow:0 4px 16px rgba(99,102,241,0.6); }
+
+  /* Crosshair for FPS mode */
+  #crosshair {
+    position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
+    z-index:5; pointer-events:none; display:none;
+  }
+  #crosshair::before, #crosshair::after {
+    content:''; position:absolute; background:rgba(255,255,255,0.5);
+  }
+  #crosshair::before { width:20px; height:2px; top:-1px; left:-10px; }
+  #crosshair::after  { width:2px; height:20px; top:-10px; left:-1px; }
+
+  /* Loading overlay */
+  #loading {
+    position:absolute; top:0; left:0; width:100%; height:100%; z-index:100;
+    background:rgba(10,10,30,0.95); display:flex; flex-direction:column;
+    align-items:center; justify-content:center;
+  }
+  #loading .spinner { width:48px; height:48px; border:4px solid rgba(100,140,255,0.2);
+    border-top-color:#7da8ff; border-radius:50%; animation:spin 1s linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  #loading p { margin-top:16px; color:#7da8ff; font-size:15px; }
+</style>
+</head>
+<body>
+
+<div id="canvas-container">
+  <div id="loading"><div class="spinner"></div><p>Loading 3D World…</p></div>
+
+  <div id="hud">
+    <div class="panel" id="camera-panel">
+      <h3>📷 Camera</h3>
+      <div>Position: <span class="coord" id="cam-pos">0, 0, 0</span></div>
+      <div>Rotation: <span class="coord" id="cam-rot">0°, 0°, 0°</span></div>
+      <div>Yaw: <span class="coord" id="cam-yaw">0°</span> &nbsp; Pitch: <span class="coord" id="cam-pitch">0°</span></div>
+    </div>
+    <div class="panel" id="objects-panel">
+      <h3>🎯 Objects</h3>
+      <div id="obj-list">Loading…</div>
+    </div>
+    <div class="panel" id="nearest-panel" style="display:none">
+      <h3>🔊 Nearest Object</h3>
+      <div id="nearest-info"></div>
+    </div>
+  </div>
+
+  <button id="mode-toggle">🖱 Orbit Mode</button>
+  <div id="crosshair"></div>
+
+  <div id="controls-help">
+    <strong>Orbit:</strong> <kbd>LMB</kbd> rotate · <kbd>RMB</kbd> pan · <kbd>Scroll</kbd> zoom
+    &nbsp;|&nbsp;
+    <strong>FPS:</strong> Click to lock · <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> move · <kbd>Mouse</kbd> look · <kbd>Esc</kbd> unlock
+    &nbsp;|&nbsp; <kbd>Tab</kbd> switch mode
+  </div>
+
+  <button id="send-camera">📍 Use This Camera Position</button>
+</div>
+
+<!-- Three.js from CDN -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// ── Parse scene data from URL params ──
+const params = new URLSearchParams(window.location.search);
+const sceneJsonUrl = params.get('scene') || './scene.json';
+
+// ── Renderer ──
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.2;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+document.getElementById('canvas-container').appendChild(renderer.domElement);
+
+// ── Scene ──
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1a1a2e);
+scene.fog = new THREE.FogExp2(0x1a1a2e, 0.003);
+
+// ── Lights ──
+const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+scene.add(ambientLight);
+const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+dirLight.position.set(20, 40, 30);
+dirLight.castShadow = false;
+scene.add(dirLight);
+const hemiLight = new THREE.HemisphereLight(0x87CEEB, 0x444444, 0.4);
+scene.add(hemiLight);
+
+// ── Camera ──
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 2000);
+camera.position.set(0, 5, -15);
+
+// ── Controls ──
+let currentMode = 'orbit'; // 'orbit' or 'fps'
+
+const orbitControls = new OrbitControls(camera, renderer.domElement);
+orbitControls.enableDamping = true;
+orbitControls.dampingFactor = 0.08;
+orbitControls.target.set(0, 0, 20);
+orbitControls.maxDistance = 500;
+
+const fpsControls = new PointerLockControls(camera, renderer.domElement);
+scene.add(fpsControls.getObject());
+const moveState = { forward:false, backward:false, left:false, right:false, up:false, down:false };
+const moveSpeed = 0.5;
+
+fpsControls.addEventListener('lock', () => {
+  document.getElementById('crosshair').style.display = 'block';
+});
+fpsControls.addEventListener('unlock', () => {
+  document.getElementById('crosshair').style.display = 'none';
+});
+
+// ── Grid helper ──
+const gridHelper = new THREE.GridHelper(200, 40, 0x444488, 0x333366);
+gridHelper.position.y = -0.1;
+scene.add(gridHelper);
+
+// ── Camera origin marker ──
+const originMarker = new THREE.Mesh(
+  new THREE.SphereGeometry(0.4, 16, 16),
+  new THREE.MeshStandardMaterial({ color: 0xff3333, emissive: 0x880000 })
+);
+scene.add(originMarker);
+
+// ── Object data ──
+let sceneData = { objects: [] };
+const objectPositions = []; // {label, position: THREE.Vector3}
+
+// ── Load scene ──
+async function loadScene() {
+  try {
+    const resp = await fetch(sceneJsonUrl);
+    sceneData = await resp.json();
+  } catch (e) {
+    console.warn('Could not load scene.json, using empty scene.', e);
+    document.getElementById('loading').innerHTML =
+      '<p style="color:#ff6b6b;">⚠ No scene data found. Generate a 3D world first.</p>';
+    return;
+  }
+
+  const loader = new GLTFLoader();
+  const objListEl = document.getElementById('obj-list');
+  objListEl.innerHTML = '';
+
+  // Load combined scene GLB if available
+  if (sceneData.scene_glb) {
+    try {
+      const gltf = await loadGLTF(loader, sceneData.scene_glb);
+      gltf.scene.traverse(child => {
+        if (child.isMesh) {
+          child.material.side = THREE.DoubleSide;
+        }
+      });
+      scene.add(gltf.scene);
+    } catch(e) {
+      console.warn('Failed to load combined scene GLB:', e);
+    }
+  }
+
+  // Process object metadata
+  for (const obj of sceneData.objects) {
+    const pos = new THREE.Vector3(obj.X, obj.Y, obj.Z);
+    objectPositions.push({ label: obj.label, position: pos, data: obj });
+
+    // Label sprite
+    const sprite = makeTextSprite(obj.label, obj.index);
+    sprite.position.copy(pos);
+    sprite.position.y -= (obj.scale || 5) * 0.6;  // above the object
+    scene.add(sprite);
+
+    // Object tag in HUD
+    const tag = document.createElement('span');
+    tag.className = 'label-tag';
+    tag.textContent = `[${obj.index}] ${obj.label}`;
+    objListEl.appendChild(tag);
+  }
+
+  // Set orbit target to scene centroid
+  if (objectPositions.length > 0) {
+    const centroid = new THREE.Vector3();
+    objectPositions.forEach(o => centroid.add(o.position));
+    centroid.divideScalar(objectPositions.length);
+    orbitControls.target.copy(centroid);
+    camera.position.set(centroid.x, centroid.y + 10, centroid.z - 30);
+    camera.lookAt(centroid);
+  }
+
+  document.getElementById('loading').style.display = 'none';
+}
+
+function loadGLTF(loader, url) {
+  return new Promise((resolve, reject) => {
+    loader.load(url, resolve, undefined, reject);
+  });
+}
+
+function makeTextSprite(text, index) {
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d');
+  canvas.width = 256; canvas.height = 64;
+
+  ctx.fillStyle = 'rgba(10,10,30,0.8)';
+  ctx.roundRect(0, 0, 256, 64, 8);
+  ctx.fill();
+
+  ctx.strokeStyle = 'rgba(100,140,255,0.6)';
+  ctx.lineWidth = 2;
+  ctx.roundRect(2, 2, 252, 60, 6);
+  ctx.stroke();
+
+  ctx.fillStyle = '#7da8ff';
+  ctx.font = 'bold 24px Segoe UI, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText(`[${index}] ${text}`, 128, 40);
+
+  const texture = new THREE.CanvasTexture(canvas);
+  const material = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: false });
+  const sprite = new THREE.Sprite(material);
+  sprite.scale.set(8, 2, 1);
+  return sprite;
+}
+
+// ── Mode switching ──
+function setMode(mode) {
+  currentMode = mode;
+  const btn = document.getElementById('mode-toggle');
+  if (mode === 'orbit') {
+    btn.textContent = '🖱 Orbit Mode';
+    orbitControls.enabled = true;
+    if (fpsControls.isLocked) fpsControls.unlock();
+  } else {
+    btn.textContent = '🎮 FPS Mode';
+    orbitControls.enabled = false;
+  }
+}
+
+document.getElementById('mode-toggle').addEventListener('click', () => {
+  setMode(currentMode === 'orbit' ? 'fps' : 'orbit');
+});
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Tab') { e.preventDefault(); setMode(currentMode === 'orbit' ? 'fps' : 'orbit'); }
+  if (currentMode === 'fps') {
+    switch(e.code) {
+      case 'KeyW': moveState.forward = true; break;
+      case 'KeyS': moveState.backward = true; break;
+      case 'KeyA': moveState.left = true; break;
+      case 'KeyD': moveState.right = true; break;
+      case 'Space': moveState.up = true; break;
+      case 'ShiftLeft': moveState.down = true; break;
+    }
+  }
+});
+
+document.addEventListener('keyup', (e) => {
+  switch(e.code) {
+    case 'KeyW': moveState.forward = false; break;
+    case 'KeyS': moveState.backward = false; break;
+    case 'KeyA': moveState.left = false; break;
+    case 'KeyD': moveState.right = false; break;
+    case 'Space': moveState.up = false; break;
+    case 'ShiftLeft': moveState.down = false; break;
+  }
+});
+
+renderer.domElement.addEventListener('click', () => {
+  if (currentMode === 'fps' && !fpsControls.isLocked) {
+    fpsControls.lock();
+  }
+});
+
+// ── HUD updates ──
+function updateHUD() {
+  const pos = camera.position;
+  document.getElementById('cam-pos').textContent =
+    `${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)}`;
+
+  const euler = camera.rotation;
+  const yawDeg = THREE.MathUtils.radToDeg(euler.y);
+  const pitchDeg = THREE.MathUtils.radToDeg(euler.x);
+  const rollDeg = THREE.MathUtils.radToDeg(euler.z);
+  document.getElementById('cam-rot').textContent =
+    `${pitchDeg.toFixed(1)}°, ${yawDeg.toFixed(1)}°, ${rollDeg.toFixed(1)}°`;
+  document.getElementById('cam-yaw').textContent = `${yawDeg.toFixed(1)}°`;
+  document.getElementById('cam-pitch').textContent = `${pitchDeg.toFixed(1)}°`;
+
+  // Find nearest object
+  if (objectPositions.length > 0) {
+    let minDist = Infinity, nearest = null;
+    objectPositions.forEach(o => {
+      const d = pos.distanceTo(o.position);
+      if (d < minDist) { minDist = d; nearest = o; }
+    });
+    const panel = document.getElementById('nearest-panel');
+    panel.style.display = 'block';
+    document.getElementById('nearest-info').innerHTML =
+      `<strong>${nearest.label}</strong> — <span class="coord">${minDist.toFixed(1)}</span> units away`;
+  }
+}
+
+// ── Send camera to parent (Gradio) ──
+document.getElementById('send-camera').addEventListener('click', () => {
+  const pos = camera.position;
+  const euler = camera.rotation;
+  const data = {
+    type: 'camera_update',
+    x: pos.x, y: pos.y, z: pos.z,
+    yaw: THREE.MathUtils.radToDeg(euler.y),
+    pitch: THREE.MathUtils.radToDeg(euler.x),
+    objects: objectPositions.map(o => ({
+      label: o.label,
+      distance: pos.distanceTo(o.position),
+      dx: o.position.x - pos.x,
+      dy: o.position.y - pos.y,
+      dz: o.position.z - pos.z,
+    }))
+  };
+  // Post to parent window (Gradio iframe)
+  window.parent.postMessage(JSON.stringify(data), '*');
+  // Also show visual feedback
+  const btn = document.getElementById('send-camera');
+  const orig = btn.textContent;
+  btn.textContent = '✅ Camera Sent!';
+  btn.style.background = 'linear-gradient(135deg,#22c55e,#16a34a)';
+  setTimeout(() => { btn.textContent = orig; btn.style.background = 'linear-gradient(135deg,#4a6cf7,#6366f1)'; }, 1500);
+});
+
+// ── Animation loop ──
+function animate() {
+  requestAnimationFrame(animate);
+
+  if (currentMode === 'orbit') {
+    orbitControls.update();
+  } else if (currentMode === 'fps' && fpsControls.isLocked) {
+    const direction = new THREE.Vector3();
+    const right = new THREE.Vector3();
+    camera.getWorldDirection(direction);
+    right.crossVectors(direction, camera.up).normalize();
+
+    if (moveState.forward) camera.position.addScaledVector(direction, moveSpeed);
+    if (moveState.backward) camera.position.addScaledVector(direction, -moveSpeed);
+    if (moveState.left) camera.position.addScaledVector(right, -moveSpeed);
+    if (moveState.right) camera.position.addScaledVector(right, moveSpeed);
+    if (moveState.up) camera.position.y += moveSpeed;
+    if (moveState.down) camera.position.y -= moveSpeed;
+  }
+
+  updateHUD();
+  renderer.render(scene, camera);
+}
+
+// ── Resize ──
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// ── Init ──
+loadScene();
+animate();
+</script>
+</body>
+</html>
