@@ -54,33 +54,88 @@ def main():
     with open(args.params_json, "r") as f:
         p = json.load(f)
 
-    images = p["images"]
-    # JSON dict values are list-of-lists (tuples serialise as lists) — restore tuples
-    if isinstance(images, dict):
-        images = {k: [tuple(v) for v in vlist] for k, vlist in images.items()}
+    caption = p.get("caption", "")
 
-    print(f"[AUDIO_WORKER] Starting image_to_audio | save_dir={p['save_dir']}", flush=True)
+    if caption:
+        # Combined image CLIP + text CLIP (BLIP caption) → remixer → AudioLDM
+        # Matches the evaluated "Gemini-BLIP" approach from pipeline_mm2a_SAM
+        import copy, json as _json
+        import soundfile as sf
+        import torch
+        from ssv2a.data.utils import clip_embed_images, emb2seq, set_seed
+        from ssv2a.model.pipeline_mm2a_SAM import clip_embed_texts_l14
+        from ssv2a.model.pipeline import Pipeline
+        from ssv2a.model.aldm import build_audioldm, emb_to_audio
 
-    image_to_audio(
-        images,
-        text=p.get("text", ""),
-        transcription=p.get("transcription", ""),
-        save_dir=p["save_dir"],
-        config=p["config"],
-        gen_remix=p.get("gen_remix", True),
-        gen_tracks=p.get("gen_tracks", False),
-        emb_only=p.get("emb_only", False),
-        pretrained=p["pretrained"],
-        batch_size=int(p.get("batch_size", 64)),
-        var_samples=int(p.get("var_samples", 1)),
-        shuffle_remix=p.get("shuffle_remix", True),
-        cycle_its=int(p.get("cycle_its", 3)),
-        cycle_samples=int(p.get("cycle_samples", 16)),
-        keep_data_cache=p.get("keep_data_cache", False),
-        duration=int(p.get("duration", 10)),
-        seed=int(p.get("seed", 42)),
-        device=p.get("device", "cuda"),
-    )
+        device      = p.get("device", "cuda")
+        batch_size  = int(p.get("batch_size", 64))
+        var_samples = int(p.get("var_samples", 1))
+        cycle_its   = int(p.get("cycle_its", 3))
+        cycle_samples = int(p.get("cycle_samples", 16))
+        duration    = int(p.get("duration", 10))
+        set_seed(int(p.get("seed", 42)))
+
+        images = p["images"]  # list with one crop path
+
+        print(f"[AUDIO_WORKER] Combined image+text CLIP | caption={caption!r} | save_dir={p['save_dir']}", flush=True)
+
+        with open(p["config"], "r") as fp:
+            config = _json.load(fp)
+
+        # Image CLIP (SAM crop) + Text CLIP (BLIP caption)
+        img_clips  = clip_embed_images(images, batch_size=batch_size, device=device)   # [1, 768]
+        text_clips = clip_embed_texts_l14([caption], batch_size=batch_size, device=device)  # [1, 768]
+
+        # Combined: [img_clip, text_clip] — 2 sources for 1 object
+        combined_clips = torch.stack([img_clips[0], text_clips[0]])  # [2, 768]
+        combined_jumps = [2]
+
+        model = Pipeline(copy.deepcopy(config), p["pretrained"], device)
+        model.eval()
+        with torch.no_grad():
+            remix_clips = emb2seq(
+                combined_jumps, combined_clips,
+                max_length=model.remixer.slot, delay=1, device=model.device,
+            )
+            remix_clips[:, 0, :] = img_clips[0]  # global = image clip
+            remix_clap = model.cycle_mix(
+                remix_clips, its=cycle_its, var_samples=var_samples,
+                samples=cycle_samples, shuffle=p.get("shuffle_remix", True),
+            )
+        del model, img_clips, text_clips, combined_clips, remix_clips
+
+        aldm = build_audioldm(model_name=config["audioldm_version"], device=device)
+        waveform = emb_to_audio(aldm, remix_clap, batchsize=batch_size, duration=duration)
+        sf.write(p["save_dir"], waveform[0, 0], samplerate=16000)
+
+    else:
+        images = p["images"]
+        # JSON dict values are list-of-lists (tuples serialise as lists) — restore tuples
+        if isinstance(images, dict):
+            images = {k: [tuple(v) for v in vlist] for k, vlist in images.items()}
+
+        print(f"[AUDIO_WORKER] Starting image_to_audio | save_dir={p['save_dir']}", flush=True)
+
+        image_to_audio(
+            images,
+            text=p.get("text", ""),
+            transcription=p.get("transcription", ""),
+            save_dir=p["save_dir"],
+            config=p["config"],
+            gen_remix=p.get("gen_remix", True),
+            gen_tracks=p.get("gen_tracks", False),
+            emb_only=p.get("emb_only", False),
+            pretrained=p["pretrained"],
+            batch_size=int(p.get("batch_size", 64)),
+            var_samples=int(p.get("var_samples", 1)),
+            shuffle_remix=p.get("shuffle_remix", True),
+            cycle_its=int(p.get("cycle_its", 3)),
+            cycle_samples=int(p.get("cycle_samples", 16)),
+            keep_data_cache=p.get("keep_data_cache", False),
+            duration=int(p.get("duration", 10)),
+            seed=int(p.get("seed", 42)),
+            device=p.get("device", "cuda"),
+        )
 
     result = {"status": "ok", "save_dir": p["save_dir"]}
     with open(args.result_json, "w") as f:

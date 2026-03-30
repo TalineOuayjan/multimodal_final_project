@@ -3,7 +3,7 @@ pipeline.py — Unified SSV2A Pipeline: Full Gradio Interface
 
 Complete end-to-end pipeline with step-by-step visibility:
   Step 1: Upload image → YOLO detection (toggle objects ON/OFF)
-  Step 2: Auto-chain: LLM filter → SAM → BLIP → CLIP/CLAP embeddings
+  Step 2: Auto-chain: LLM filter → BLIP → CLIP embeddings + SAM (3D only)
   Step 3: Generate 3D World (Hunyuan3D meshes + scene)
   Step 4: Generate Spatial Audio + camera re-render
 
@@ -439,7 +439,7 @@ def step_toggle_objects(sid, selected_objects):
 
 
 
-# Step 2 — Auto-chain: LLM Filter → SAM → BLIP → Embeddings
+# Step 2 — Auto-chain: LLM Filter → BLIP → CLIP Embeddings + SAM (3D only)
 
 
 def step_auto_chain(sid, skip_llm):
@@ -447,10 +447,10 @@ def step_auto_chain(sid, skip_llm):
 
     Steps:
     1. Filter to user-selected objects (ON/OFF toggles)
-    2. LLM filter (Gemini/GPT-4o) — drop silent objects (unless skipped)
-    3. SAM segmentation — isolate each kept object
-    4. BLIP captioning — caption each SAM-masked crop
-    5. CLIP embedding — image + text embeddings
+    2. LLM filter (GPT-4o) — drop silent objects (unless skipped)
+    3. SAM segmentation — isolate each kept object (used for 3D world only)
+    4. BLIP captioning — caption each original (pre-SAM) filtered crop
+    5. CLIP embedding — image CLIP (original crop) + text CLIP (BLIP caption)
 
     Returns intermediate results for display.
     """
@@ -525,6 +525,9 @@ def step_auto_chain(sid, skip_llm):
     after_llm_bboxes = [r[3] for r in remaining]
     log.append(f"\n**{len(remaining)} objects** after LLM filter\n")
 
+    # Save LLM-filtered crops BEFORE SAM — BLIP will use these, not SAM masks
+    llm_filtered_local_imgs = {img_path: list(remaining)}
+
     # ── 2c. SAM Segmentation ───────────────────────────────────────────
     log.append("### 2c. SAM Segmentation\n")
     log.append("Running SAM on each kept object (bbox + center point prompt) …")
@@ -568,9 +571,9 @@ def step_auto_chain(sid, skip_llm):
 
     # ── 2d. BLIP Captioning ────────────────────────────────────────────
     log.append("### 2d. BLIP Captioning\n")
-    log.append("Running BLIP on each SAM-masked crop …")
+    log.append("Running BLIP on GPT-4o filtered crops (original YOLO crops, not SAM masks) …")
     try:
-        captions = blip_caption_crops(local_imgs, device=DEVICE)
+        captions = blip_caption_crops(llm_filtered_local_imgs, device=DEVICE)
         caption_list = captions.get(img_path, [])
         for i, cap in enumerate(caption_list):
             lbl = after_llm_labels[i] if i < len(after_llm_labels) else "?"
@@ -595,8 +598,8 @@ def step_auto_chain(sid, skip_llm):
     log.append("Computing CLIP ViT-L/14 image + text embeddings …")
     yield kept_gallery_items, dropped_gallery_items, combined_sam, "\n\n".join(log)  # keep connection alive
     try:
-        # Image CLIP embeddings
-        crop_paths_final = [sc[0] for sc in sam_crops]
+        # Image CLIP embeddings — use original GPT-4o filtered crops, not SAM masks
+        crop_paths_final = [r[0] for r in llm_filtered_local_imgs[img_path]]
         img_clip_embeds = clip_embed_images(crop_paths_final, device=DEVICE)
 
         # Text CLIP embeddings (from BLIP captions)
@@ -624,7 +627,8 @@ def step_auto_chain(sid, skip_llm):
     sess["local_imgs_filtered"] = local_imgs
     sess["after_llm_labels"] = after_llm_labels
     sess["after_llm_bboxes"] = after_llm_bboxes
-    sess["sam_crop_paths"] = [sc[0] for sc in sam_crops]
+    sess["sam_crop_paths"] = [sc[0] for sc in sam_crops]          # SAM → 3D world only
+    sess["llm_crop_paths"] = [r[0] for r in llm_filtered_local_imgs[img_path]]  # original → audio CLIP
 
     yield kept_gallery_items, dropped_gallery_items, combined_sam, "\n\n".join(log)
 
@@ -644,7 +648,7 @@ def _get_active_objects(sess):
         return (
             list(sess["after_llm_labels"]),
             list(sess["after_llm_bboxes"]),
-            list(sess.get("sam_crop_paths", sess["crop_paths"])),
+            list(sess.get("llm_crop_paths", sess.get("sam_crop_paths", sess["crop_paths"]))),
         )
 
     # Fall back to toggle filter
@@ -935,19 +939,31 @@ def step_generate_audio(sid,
     tracks_dir.mkdir(exist_ok=True)
 
     per_object_waves = []
+    captions = sess.get("captions", [])
+    use_blip = len(captions) == n
+
     for i, (cp, lbl) in enumerate(zip(crop_paths, labels)):
         log.append(f"  [{i+1}/{n}] {lbl} …")
-        crop_dict = {cp: [(cp, 1.0)]}
         obj_dir = tracks_dir / f"obj_{i}"
         obj_dir.mkdir(exist_ok=True)
 
-        _run_audio_worker(
-            crop_dict,
-            save_dir=str(obj_dir),
-            params=dict(_base_params, keep_data_cache=True),
-        )
-
-        obj_wav = str(obj_dir / (Path(cp).stem + ".wav"))
+        if use_blip:
+            caption = captions[i]
+            log.append(f"    BLIP caption: \"{caption}\" → combined image+text CLIP")
+            obj_wav = str(obj_dir / "audio.wav")
+            _run_audio_worker(
+                [cp],
+                save_dir=obj_wav,
+                params=dict(_base_params, caption=caption),
+            )
+        else:
+            crop_dict = {cp: [(cp, 1.0)]}
+            _run_audio_worker(
+                crop_dict,
+                save_dir=str(obj_dir),
+                params=dict(_base_params, keep_data_cache=True),
+            )
+            obj_wav = str(obj_dir / (Path(cp).stem + ".wav"))
         wave, _ = _sf.read(obj_wav)
         if wave.ndim > 1:
             wave = wave[:, 0]
@@ -1083,12 +1099,12 @@ def build_ui():
         
         # Step 2: Auto-chain (LLM → SAM → BLIP → Embeddings)
     
-        gr.Markdown("---\n## Step 2 — LLM Filter → SAM → BLIP → Embeddings")
+        gr.Markdown("---\n## Step 2 — LLM Filter → BLIP → CLIP Embeddings + SAM (3D only)")
         gr.Markdown(
             "This step auto-chains: **LLM sound-source filter** (GPT-4o) → "
-            "**SAM segmentation** (isolate objects) → **BLIP captioning** → "
-            "**CLIP embeddings** (image + text).\n\n"
-            "Results from each sub-step are shown in the log."
+            "**BLIP captioning** (on original filtered crops) → "
+            "**CLIP embeddings** (image + text) → **SAM segmentation** (for 3D world only).\n\n"
+            "Audio generation uses the original YOLO crops + BLIP captions. SAM masks are only used in Step 3 for 3D mesh generation."
         )
 
         skip_llm = gr.Checkbox(label="Skip LLM filter (keep all objects)", value=False)
