@@ -30,9 +30,29 @@ source ssv2a_env/bin/activate          # Linux / Mac
 
 # Install all dependencies
 pip install -r requirements.txt
-pip install -r Hunyuan3D-2/requirements.txt
 pip install gradio fastapi uvicorn soundfile transformers diffusers accelerate openai trimesh
+deactivate
 ```
+
+Then create a **second** environment for Hunyuan3D-2 (3D generation). This one must use **Python 3.10** — the two environments are kept separate because Hunyuan3D-2 has conflicting dependencies with the main pipeline.
+
+```bash
+# Check you have Python 3.10 available
+python3.10 --version
+
+# Create and set up hy3d_env (must be named exactly hy3d_env, inside the SSV2A folder)
+python3.10 -m venv hy3d_env
+source hy3d_env/bin/activate           # Linux / Mac
+
+# Install Hunyuan3D-2 and all its dependencies
+pip install -r Hunyuan3D-2/requirements.txt
+pip install -e Hunyuan3D-2/            # installs the hy3dgen package in editable mode
+pip install rembg pymeshlab xatlas numba
+
+deactivate
+```
+
+> **Note:** The 3D generation step (Step 3 in the UI) launches `hy3d_env/bin/python` as a subprocess automatically — you do **not** need to activate `hy3d_env` manually when running the pipeline.
 
 ---
 
@@ -48,8 +68,8 @@ Once downloaded, place them like this:
 SSV2A/
 ├── sam_b.pt                     ← place in the root (next to pipeline.py)
 └── weights/
-    ├── ssv2a.json               ← already in the repo, don't touch
-    ├── dalle2_prior_config.json ← already in the repo, don't touch
+    ├── ssv2a.json               
+    ├── dalle2_prior_config.json
     ├── ssv2a.pth                ← from Drive
     ├── agg.pth                  ← from Drive
     ├── dalle2_prior.pth         ← from Drive
